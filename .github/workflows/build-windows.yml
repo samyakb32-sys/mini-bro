@@ -1,0 +1,46 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: ["claude/**", main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests (includes the real Windows named pipe)
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s tests -t . -v
+
+      - name: Build exes
+        shell: cmd
+        run: build.bat
+
+      - name: Smoke test the relay exe
+        shell: pwsh
+        run: |
+          '{}' | .\dist\minibro-hook.exe --agent claude
+          if ($LASTEXITCODE -ne 0) { throw "minibro-hook.exe exited with $LASTEXITCODE" }
+
+      - name: Smoke test the island exe (must stay running)
+        shell: pwsh
+        run: |
+          $p = Start-Process .\dist\MiniBro.exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "MiniBro.exe exited early with code $($p.ExitCode)" }
+          "MiniBro.exe still running after 8s, memory: $([math]::Round($p.WorkingSet64/1MB,1)) MB"
+          Stop-Process -Id $p.Id -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MiniBro-windows
+          path: |
+            dist/MiniBro.exe
+            dist/minibro-hook.exe

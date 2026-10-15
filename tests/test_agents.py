@@ -95,7 +95,10 @@ class RelayTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addr = os.path.join(self.tmp.name, "s.sock")
+        if sys.platform == "win32":  # exercise the real Windows named pipe
+            self.addr = r"\\.\pipe\minibro-test-" + os.path.basename(self.tmp.name)
+        else:
+            self.addr = os.path.join(self.tmp.name, "s.sock")
         with open(os.path.join(self.tmp.name, "token"), "w") as f:
             f.write("secret")
         self.env = dict(os.environ, MINIBRO_ADDR=self.addr, MINIBRO_HOME=self.tmp.name)
