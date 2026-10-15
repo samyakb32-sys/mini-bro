@@ -7,16 +7,16 @@ DEFAULTS = {"expiry_minutes": 60, "x": None, "y": None}
 
 
 def app_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
-    path = os.path.join(base, "MiniBro")
+    path = os.environ.get("MINIBRO_HOME") or os.path.join(
+        os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share"), "MiniBro")
     os.makedirs(path, exist_ok=True)
     return path
 
 
-def write_json_atomic(path, data):
+def write_json_atomic(path, data, indent=None):
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=indent, ensure_ascii=False)
     os.replace(tmp, path)
 
 

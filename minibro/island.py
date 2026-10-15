@@ -1,15 +1,21 @@
-"""Top-of-screen island. A thin strip that slides out into a black shelf panel on hover or drop.
+"""Top-of-screen island. A thin strip that slides out on hover, drop, or when an agent needs you.
 
-One window, one canvas, everything drawn by hand: no per-row widgets, no background threads.
-Animation timers only run during the ~150 ms open/close transitions.
+One window, one canvas, everything drawn by hand: no per-row widgets. Tk stays on the main thread;
+the pipe server and URL downloads run on short threads and hand results over through queues.
+Animation timers only run during the ~130 ms open/close transitions.
+
+Tabs: Shelf (temporary files) and Agents (live coding-agent sessions). Permission requests from
+agents appear as Allow/Deny cards above the tabs and pop the island open.
 """
+import queue
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 
 from tkinterdnd2 import COPY, DND_FILES, DND_TEXT, TkinterDnD
 
-from . import autostart, clipboard
+from . import agents, autostart, clipboard
 from .fetch import download, is_url
 
 TRANSPARENT = "#010203"
@@ -17,18 +23,25 @@ BLACK = "#000000"
 TEXT = "#f2f2f7"
 DIM = "#8e8e93"
 ACCENT = "#0a84ff"
+ORANGE = "#ff9f0a"
+GREEN = "#30d158"
 ROW_HOVER = "#1c1c1e"
+BTN = "#2c2c2e"
 BAR = "#3a3a3c"
 
 W = 340  # expanded width
 HEADER = 46
 ROW = 46
+CARD_H = 100
+MAX_CARDS = 3
 PAD = 14
 RADIUS = 24
 MAX_ROWS = 6
 STRIP_W, STRIP_H = 132, 6  # collapsed hit area
 FRAMES, FRAME_MS = 9, 14
+POLL_MS = 200
 FONT = "Segoe UI"
+STATUS_COLOR = {"waiting": ORANGE, "working": GREEN, "idle": BAR}
 
 
 def human_size(n):
@@ -45,21 +58,35 @@ def time_left(expires):
     return f"{max(1, secs // 60)}m left"
 
 
+def ago(ts):
+    secs = max(0, int(time.time() - ts))
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    return f"{secs // 3600}h ago"
+
+
 def ease(t):
     return 1 - (1 - t) ** 3
 
 
 class Island:
-    def __init__(self, store, config):
+    def __init__(self, store, config, events=None, tracker=None):
         self.store = store
         self.config = config
+        self.events = events or queue.Queue()
+        self.tracker = tracker or agents.Tracker()
+        self.cards = []  # pending permission requests (server.Card)
+        self.tab = "shelf"
         self.expanded = False
         self.drop_hover = False
         self.dragging = False
         self.menu_open = False
         self.hover_row = None
         self.busy = 0  # downloads in flight
-        self.rows = []  # [(item_id, y0, y1)]
+        self.rows = []  # shelf rows: [(item_id, y0, y1)]
+        self.buttons = []  # card buttons: [(card, decision, x0, y0, x1, y1)]
         self.w, self.h = STRIP_W, STRIP_H
         self._anim = None
         self._leave_job = None
@@ -96,16 +123,24 @@ class Island:
         self.expiry_var = tk.IntVar(value=config["expiry_minutes"])
         self.menu = self.build_menu()
         self.purge_loop()
+        self.poll_events()
 
     # --- geometry / animation ----------------------------------------------
     def place(self, w, h):
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"{int(w)}x{int(h)}+{(sw - int(w)) // 2}+0")
 
+    def cards_height(self):
+        n = len(self.cards)
+        return min(n, MAX_CARDS) * CARD_H + (20 if n > MAX_CARDS else 0)
+
+    def body_count(self):
+        return len(self.store.items) if self.tab == "shelf" else len(self.tracker.sessions)
+
     def target_height(self):
-        n = min(len(self.store.items), MAX_ROWS)
-        body = max(n, 1) * ROW + (22 if len(self.store.items) > MAX_ROWS else 0)
-        return HEADER + body + PAD
+        count = self.body_count()
+        body = max(min(count, MAX_ROWS), 1) * ROW + (22 if count > MAX_ROWS else 0)
+        return HEADER + self.cards_height() + body + PAD
 
     def animate_to(self, w, h, done=None):
         if self._anim:
@@ -167,7 +202,7 @@ class Island:
 
     def leave_check(self):
         self._leave_job = None
-        if self.dragging or self.menu_open or self.drop_hover:
+        if self.dragging or self.menu_open or self.drop_hover or self.cards:
             return
         px, py = self.root.winfo_pointerxy()
         x0, y0 = self.root.winfo_rootx(), self.root.winfo_rooty()
@@ -198,42 +233,69 @@ class Island:
         outline = ACCENT if self.drop_hover else BLACK
         self.rounded_bottom(w, h, RADIUS if h > 20 else h, fill=BLACK, outline=outline,
                             width=2 if self.drop_hover else 1)
-        self.rows = []
+        self.rows, self.buttons = [], []
         if not self.expanded:
             if h <= STRIP_H + 1:
-                n = len(self.store.items)
-                color = ACCENT if n else BAR
+                color = ORANGE if self.cards else ACCENT if self.store.items else BAR
                 c.create_rectangle(w // 2 - 22, 1, w // 2 + 22, 4, fill=color, outline=color)
             return
         if not content or self.w < W - 1:
             return
         self.draw_header()
-        self.draw_rows()
+        y = HEADER + self.draw_cards()
+        if self.tab == "shelf":
+            self.draw_shelf(y)
+        else:
+            self.draw_agents(y)
+        for card in self.cards[:MAX_CARDS]:
+            card.shown.set()  # the card is on screen: the server may now wait for the answer
 
     def draw_header(self):
         c = self.canvas
-        n = len(self.store.items)
-        c.create_text(PAD + 4, HEADER // 2 + 2, text="Shelf", anchor="w", fill=TEXT,
-                      font=(FONT, 12, "bold"))
-        if n:
-            c.create_text(PAD + 52, HEADER // 2 + 3, text=str(n), anchor="w", fill=DIM,
-                          font=(FONT, 10))
+        mid = HEADER // 2 + 2
+        n_items, n_agents = len(self.store.items), len(self.tracker.sessions)
+        for label, key, x, count in (("Shelf", "shelf", PAD + 4, n_items), ("Agents", "agents", PAD + 66, n_agents)):
+            active = self.tab == key
+            t = c.create_text(x, mid, text=label, anchor="w", fill=TEXT if active else DIM,
+                              font=(FONT, 12 if active else 11, "bold" if active else "normal"))
+            if count:
+                bx = c.bbox(t)[2] + 4
+                c.create_text(bx, mid + 1, text=str(count), anchor="w", fill=DIM, font=(FONT, 9))
         if self.busy:
-            c.create_text(PAD + 80, HEADER // 2 + 3, text="Saving…", anchor="w", fill=ACCENT,
-                          font=(FONT, 9))
-        c.create_text(W - PAD - 38, HEADER // 2 + 2, text="Paste", anchor="e", fill=ACCENT,
-                      font=(FONT, 10))
-        c.create_text(W - PAD - 6, HEADER // 2 + 1, text="⋯", anchor="e", fill=DIM,
-                      font=(FONT, 16, "bold"), tags="gear")
+            c.create_text(PAD + 160, mid + 1, text="Saving…", anchor="w", fill=ACCENT, font=(FONT, 9))
+        if self.tab == "shelf":
+            c.create_text(W - PAD - 38, mid, text="Paste", anchor="e", fill=ACCENT, font=(FONT, 10))
+        c.create_text(W - PAD - 6, HEADER // 2 + 1, text="⋯", anchor="e", fill=DIM, font=(FONT, 16, "bold"))
 
-    def draw_rows(self):
+    def draw_cards(self):
+        c = self.canvas
+        y = HEADER
+        for card in self.cards[:MAX_CARDS]:
+            x0, x1, y0, y1 = PAD - 4, W - PAD + 4, y + 4, y + CARD_H - 4
+            c.create_rectangle(x0, y0, x1, y1, fill=ROW_HOVER, outline=ORANGE)
+            c.create_text(x0 + 10, y0 + 14, anchor="w", fill=ORANGE, font=(FONT, 9, "bold"),
+                          text=f"{agents.agent_name(card.agent)} · {agents.project_name(card.cwd)}")
+            c.create_text(x0 + 10, y0 + 28, anchor="nw", fill=TEXT, font=(FONT, 9), width=x1 - x0 - 20,
+                          text=agents.summarize_tool(card.tool, card.tool_input, 110))
+            by0, by1 = y1 - 32, y1 - 8
+            for decision, label, bx1, fill in (("allow", "Allow", x1 - 10, ACCENT), ("deny", "Deny", x1 - 94, BTN)):
+                bx0 = bx1 - 78
+                c.create_rectangle(bx0, by0, bx1, by1, fill=fill, outline=fill)
+                c.create_text((bx0 + bx1) // 2, (by0 + by1) // 2, text=label, fill="white", font=(FONT, 10, "bold"))
+                self.buttons.append((card, decision, bx0, by0, bx1, by1))
+            y += CARD_H
+        extra = len(self.cards) - MAX_CARDS
+        if extra > 0:
+            c.create_text(W // 2, y + 10, text=f"+{extra} more waiting", fill=ORANGE, font=(FONT, 9))
+        return self.cards_height()
+
+    def draw_shelf(self, y):
         c = self.canvas
         items = self.store.list()
         if not items:
-            c.create_text(W // 2, HEADER + ROW // 2, fill=DIM, font=(FONT, 10),
+            c.create_text(W // 2, y + ROW // 2, fill=DIM, font=(FONT, 10),
                           text="Drop files or images here, or press Ctrl+V to paste.")
             return
-        y = HEADER
         for item in items[:MAX_ROWS]:
             y0, y1 = y, y + ROW
             self.rows.append((item["id"], y0, y1))
@@ -250,27 +312,63 @@ class Island:
         if extra > 0:
             c.create_text(W // 2, y + 11, text=f"+{extra} more", fill=DIM, font=(FONT, 9))
 
+    def draw_agents(self, y):
+        c = self.canvas
+        sessions = self.tracker.list()
+        if not sessions:
+            c.create_text(W // 2, y + ROW // 2, fill=DIM, font=(FONT, 10),
+                          text="No agents yet. Use ⋯ then Connect Claude Code.")
+            return
+        for s in sessions[:MAX_ROWS]:
+            y0, y1 = y, y + ROW
+            color = STATUS_COLOR[s["status"]]
+            c.create_oval(PAD + 4, y0 + 14, PAD + 12, y0 + 22, fill=color, outline=color)
+            c.create_text(PAD + 22, y0 + 17, text=agents.project_name(s["cwd"]), anchor="w", fill=TEXT, font=(FONT, 10))
+            c.create_text(PAD + 22, y0 + 34, anchor="w", fill=DIM, font=(FONT, 8),
+                          text=f"{agents.agent_name(s['agent'])}  ·  {s['status']}  ·  {ago(s.get('updated', time.time()))}")
+            y = y1
+        extra = len(sessions) - MAX_ROWS
+        if extra > 0:
+            c.create_text(W // 2, y + 11, text=f"+{extra} more", fill=DIM, font=(FONT, 9))
+
     # --- clicks / menu ---------------------------------------------------------
+    def set_tab(self, tab):
+        if tab != self.tab:
+            self.tab = tab
+            self.hover_row = None
+            self.resize_to_content()
+
     def on_click(self, event):
         if not self.expanded:
             return
         self.root.focus_force()  # so Ctrl+V works after clicking the island
-        if event.y < HEADER and W - PAD - 100 < event.x <= W - PAD - 40:
-            self.paste()
+        for card, decision, x0, y0, x1, y1 in self.buttons:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                self.answer(card, decision)
+                return
+        if event.y < HEADER:
+            if event.x > W - PAD - 40:
+                self.open_menu()
+            elif self.tab == "shelf" and W - PAD - 100 < event.x <= W - PAD - 40:
+                self.paste()
+            elif event.x < PAD + 62:
+                self.set_tab("shelf")
+            elif event.x < PAD + 150:
+                self.set_tab("agents")
             return
-        if event.y < HEADER and event.x > W - PAD - 40:
-            self.menu_open = True
-            try:
-                self.menu.tk_popup(self.root.winfo_rootx() + W - 150, self.root.winfo_rooty() + HEADER)
-            finally:
-                self.menu.grab_release()
-                self.menu_open = False
-                self.schedule_leave_check()
-            return
-        if self.hover_row and event.x > W - PAD - 30:
+        if self.tab == "shelf" and self.hover_row and event.x > W - PAD - 30:
             self.store.remove(self.hover_row)
             self.hover_row = None
             self.resize_to_content()
+
+    def open_menu(self):
+        self.menu_open = True
+        try:
+            self.menu.tk_popup(self.root.winfo_rootx() + W - 150, self.root.winfo_rooty() + HEADER)
+        finally:
+            self.menu.grab_release()
+            self.menu_open = False
+            self.schedule_leave_check()
 
     def build_menu(self):
         menu = tk.Menu(self.root, tearoff=0)
@@ -282,8 +380,11 @@ class Island:
         menu.add_cascade(label="Keep files for", menu=expiry)
         menu.add_checkbutton(label="Start with Windows", variable=self.autostart_var,
                              command=lambda: autostart.set_enabled(self.autostart_var.get()))
-        menu.add_command(label="Clear all", command=self.clear_all)
         menu.add_separator()
+        menu.add_command(label="Connect Claude Code…", command=lambda: self.connect_claude(False))
+        menu.add_command(label="Disconnect Claude Code…", command=lambda: self.connect_claude(True))
+        menu.add_separator()
+        menu.add_command(label="Clear shelf", command=self.clear_all)
         menu.add_command(label="Quit", command=self.root.destroy)
         return menu
 
@@ -291,9 +392,98 @@ class Island:
         self.store.clear()
         self.resize_to_content()
 
-    # --- drag and drop -----------------------------------------------------------
+    # --- agents: cards, events, hook install -------------------------------------
+    def answer(self, card, decision):
+        card.finish(decision)
+        if card in self.cards:
+            self.cards.remove(card)
+        self.tracker.set_status(card.agent, card.session_id, "working" if decision == "allow" else "idle")
+        self.resize_to_content()
+        if not self.cards:
+            self.schedule_leave_check()
+
+    def poll_events(self):
+        new_card = changed = False
+        try:
+            while True:
+                kind, payload = self.events.get_nowait()
+                changed = True
+                if kind == "card":
+                    self.cards.append(payload)
+                    new_card = True
+                    self.tracker.update({"agent": payload.agent, "session_id": payload.session_id,
+                                         "event": "PermissionRequest", "cwd": payload.cwd})
+                else:
+                    self.tracker.update(payload)
+        except queue.Empty:
+            pass
+        live = [c for c in self.cards if not c.done.is_set()]  # the server declines cards after its timeout
+        if len(live) != len(self.cards):
+            self.cards, changed = live, True
+        if new_card and not self.expanded:
+            self.expand()
+        elif changed:
+            self.resize_to_content()
+        self.root.after(POLL_MS, self.poll_events)
+
+    def connect_claude(self, disconnect):
+        path = agents.claude_settings_path()
+        self.menu_open = True
+        try:
+            try:
+                data, text = agents.read_settings(path)
+            except ValueError as e:
+                messagebox.showerror("Mini-Bro", f"{path} is not valid JSON ({e}). Nothing was changed.")
+                return
+            if disconnect:
+                new = agents.remove_hooks(data)
+            else:
+                python_exe, hook_path = agents.hook_target()
+                new = agents.merge_hooks(data, agents.hook_command(python_exe, hook_path))
+            patch = agents.diff(text, new)
+            if not patch:
+                messagebox.showinfo("Mini-Bro", "Already up to date. Nothing to change.")
+                return
+            title = "Disconnect Claude Code" if disconnect else "Connect Claude Code"
+            if self.confirm_diff(title, path, patch):
+                backup = agents.apply_settings(path, new)
+                messagebox.showinfo("Mini-Bro", "Saved." + (f"\nBackup: {backup}" if backup else "")
+                                    + ("\nRestart Claude Code sessions to pick up the change." if not disconnect else ""))
+        finally:
+            self.menu_open = False
+            self.schedule_leave_check()
+
+    def confirm_diff(self, title, path, patch):
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.attributes("-topmost", True)
+        top.geometry("640x420")
+        tk.Label(top, anchor="w", justify="left", text=f"These changes will be written to:\n{path}\n"
+                 "A dated backup is made first. Nothing is written until you click Apply.").pack(fill="x", padx=10, pady=8)
+        box = tk.Text(top, wrap="none", font=("Consolas", 9))
+        box.insert("1.0", patch)
+        for i, line in enumerate(patch.splitlines(), 1):
+            if line.startswith("+") and not line.startswith("+++"):
+                box.tag_add("add", f"{i}.0", f"{i}.end")
+            elif line.startswith("-") and not line.startswith("---"):
+                box.tag_add("del", f"{i}.0", f"{i}.end")
+        box.tag_config("add", foreground="#1a7f37")
+        box.tag_config("del", foreground="#cf222e")
+        box.config(state="disabled")
+        box.pack(fill="both", expand=True, padx=10)
+        result = []
+        bar = tk.Frame(top)
+        bar.pack(fill="x", padx=10, pady=8)
+        tk.Button(bar, text="Apply", width=10, command=lambda: (result.append(True), top.destroy())).pack(side="right")
+        tk.Button(bar, text="Cancel", width=10, command=top.destroy).pack(side="right", padx=6)
+        top.grab_set()
+        self.root.wait_window(top)
+        return bool(result)
+
+    # --- shelf: drag and drop --------------------------------------------------------
     def on_drop_enter(self, event):
         self.drop_hover = True
+        self.tab = "shelf"
         self.expand()
         self.render()
         return event.action
@@ -348,6 +538,8 @@ class Island:
         self.resize_to_content()
 
     def paste(self):
+        if self.tab != "shelf":
+            return
         got = clipboard.read()
         if not got:
             return
@@ -373,11 +565,12 @@ class Island:
 
     # --- timers ----------------------------------------------------------------------
     def schedule_tick(self):
-        # Refresh "time left" labels only while the panel is open.
+        # Refresh "time left" / "ago" labels only while the panel is open.
         self._tick_job = self.root.after(30000, self.tick)
 
     def tick(self):
         self.store.purge_expired()
+        self.tracker.prune()
         self.resize_to_content()
         if self.expanded:
             self.schedule_tick()
