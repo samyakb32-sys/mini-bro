@@ -70,6 +70,21 @@ class Store:
         self._save()
         return item
 
+    def add_bytes(self, name, data, ttl_seconds):
+        """Hold in-memory data (pasted or downloaded image) as a file."""
+        name = os.path.basename(name) or "file"
+        item_id = uuid.uuid4().hex[:12]
+        folder = os.path.join(self.root, item_id)
+        os.makedirs(folder)
+        target = os.path.join(folder, name)
+        with open(target, "wb") as f:
+            f.write(data)
+        item = {"id": item_id, "name": name, "path": target, "stored": True,
+                "size": len(data), "expires": self.clock() + ttl_seconds}
+        self.items[item_id] = item
+        self._save()
+        return item
+
     def _delete_files(self, item):
         if item["stored"]:
             shutil.rmtree(os.path.join(self.root, item["id"]), ignore_errors=True)

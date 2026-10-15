@@ -6,7 +6,7 @@ slides out into a black shelf. Drag items back out to anywhere. Held items are
 deleted automatically when they expire.
 
 Built to be light: stdlib `tkinter` plus `tkinterdnd2` for drag and drop. It sits
-idle (no threads, one 60-second timer) so it runs fine on old PCs.
+idle (one 60-second timer; a short-lived thread runs only while a browser image downloads) so it runs fine on old PCs.
 
 ## Run
 
@@ -19,6 +19,8 @@ python -m minibro.main
 
 - **Hover** the strip at the top-center of the screen to open the shelf; move away to close it.
 - **Drop** files or folders onto the strip or the open shelf.
+- **Paste** with Ctrl+V (click the island first) or the Paste button: copied files, or a copied image or screenshot.
+- **Drag images from a browser** onto the island; they are downloaded (up to 50 MB) and held like any file.
 - **Drag** a row out to copy the item elsewhere. Hover a row and click ✕ to remove it.
 - **⋯** menu: how long to keep files (default 1 hour), Start with Windows, Clear all, Quit.
 

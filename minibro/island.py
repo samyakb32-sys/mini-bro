@@ -3,12 +3,14 @@
 One window, one canvas, everything drawn by hand: no per-row widgets, no background threads.
 Animation timers only run during the ~150 ms open/close transitions.
 """
+import threading
 import time
 import tkinter as tk
 
-from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
+from tkinterdnd2 import COPY, DND_FILES, DND_TEXT, TkinterDnD
 
-from . import autostart
+from . import autostart, clipboard
+from .fetch import download, is_url
 
 TRANSPARENT = "#010203"
 BLACK = "#000000"
@@ -56,6 +58,7 @@ class Island:
         self.dragging = False
         self.menu_open = False
         self.hover_row = None
+        self.busy = 0  # downloads in flight
         self.rows = []  # [(item_id, y0, y1)]
         self.w, self.h = STRIP_W, STRIP_H
         self._anim = None
@@ -79,8 +82,9 @@ class Island:
         self.root.bind("<Leave>", lambda _e: self.schedule_leave_check())
         self.canvas.bind("<Motion>", self.on_motion)
         self.canvas.bind("<Button-1>", self.on_click)
+        self.root.bind("<Control-v>", lambda _e: self.paste())
 
-        self.canvas.drop_target_register(DND_FILES)
+        self.canvas.drop_target_register(DND_FILES, DND_TEXT)
         self.canvas.dnd_bind("<<DropEnter>>", self.on_drop_enter)
         self.canvas.dnd_bind("<<DropLeave>>", self.on_drop_leave)
         self.canvas.dnd_bind("<<Drop>>", self.on_drop)
@@ -214,6 +218,11 @@ class Island:
         if n:
             c.create_text(PAD + 52, HEADER // 2 + 3, text=str(n), anchor="w", fill=DIM,
                           font=(FONT, 10))
+        if self.busy:
+            c.create_text(PAD + 80, HEADER // 2 + 3, text="Saving…", anchor="w", fill=ACCENT,
+                          font=(FONT, 9))
+        c.create_text(W - PAD - 38, HEADER // 2 + 2, text="Paste", anchor="e", fill=ACCENT,
+                      font=(FONT, 10))
         c.create_text(W - PAD - 6, HEADER // 2 + 1, text="⋯", anchor="e", fill=DIM,
                       font=(FONT, 16, "bold"), tags="gear")
 
@@ -222,7 +231,7 @@ class Island:
         items = self.store.list()
         if not items:
             c.create_text(W // 2, HEADER + ROW // 2, fill=DIM, font=(FONT, 10),
-                          text="Drop files here. They disappear when time runs out.")
+                          text="Drop files or images here, or press Ctrl+V to paste.")
             return
         y = HEADER
         for item in items[:MAX_ROWS]:
@@ -244,6 +253,10 @@ class Island:
     # --- clicks / menu ---------------------------------------------------------
     def on_click(self, event):
         if not self.expanded:
+            return
+        self.root.focus_force()  # so Ctrl+V works after clicking the island
+        if event.y < HEADER and W - PAD - 100 < event.x <= W - PAD - 40:
+            self.paste()
             return
         if event.y < HEADER and event.x > W - PAD - 40:
             self.menu_open = True
@@ -293,14 +306,58 @@ class Island:
 
     def on_drop(self, event):
         self.drop_hover = False
-        ttl = self.config["expiry_minutes"] * 60
-        for path in self.root.tk.splitlist(event.data):
-            try:
-                self.store.add(path, ttl)
-            except OSError:
-                continue
+        for part in self.root.tk.splitlist(event.data):
+            if is_url(part):
+                self.fetch_url(part)
+            else:
+                self.add_path(part)
         self.resize_to_content()
         return COPY
+
+    def ttl(self):
+        return self.config["expiry_minutes"] * 60
+
+    def add_path(self, path):
+        try:
+            self.store.add(path, self.ttl())
+        except OSError:
+            pass
+
+    def fetch_url(self, url):
+        """Download an image dragged from a browser on a short-lived thread; Tk stays on the main thread."""
+        self.busy += 1
+        result = []
+
+        def work():
+            try:
+                result.append(download(url))
+            except Exception:
+                result.append(None)
+
+        threading.Thread(target=work, daemon=True).start()
+        self.poll_fetch(result)
+
+    def poll_fetch(self, result):
+        if not result:
+            self.render(content=self.expanded)
+            self.root.after(250, self.poll_fetch, result)
+            return
+        self.busy -= 1
+        if result[0]:
+            self.store.add_bytes(result[0][0], result[0][1], self.ttl())
+        self.resize_to_content()
+
+    def paste(self):
+        got = clipboard.read()
+        if not got:
+            return
+        kind, payload = got
+        if kind == "files":
+            for path in payload:
+                self.add_path(path)
+        else:
+            self.store.add_bytes(time.strftime("pasted-%H%M%S.png"), payload, self.ttl())
+        self.resize_to_content()
 
     def on_drag_init(self, event):
         for item_id, y0, y1 in self.rows:
