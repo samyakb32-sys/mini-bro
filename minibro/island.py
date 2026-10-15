@@ -42,6 +42,11 @@ FRAMES, FRAME_MS = 9, 14
 POLL_MS = 200
 FONT = "Segoe UI"
 STATUS_COLOR = {"waiting": ORANGE, "working": GREEN, "idle": BAR}
+AFTER_CONNECT = {
+    "claude": "\nRestart Claude Code sessions to pick up the change.",
+    "codex": "\nIn Codex, run /hooks to review and trust the new hooks, then start a new session.",
+    "gemini": "\nRestart Gemini CLI. Gemini only reports status here: its permission prompts stay in the terminal.",
+}
 
 
 def human_size(n):
@@ -317,7 +322,7 @@ class Island:
         sessions = self.tracker.list()
         if not sessions:
             c.create_text(W // 2, y + ROW // 2, fill=DIM, font=(FONT, 10),
-                          text="No agents yet. Use ⋯ then Connect Claude Code.")
+                          text="No agents yet. Use ⋯ then Connect agent.")
             return
         for s in sessions[:MAX_ROWS]:
             y0, y1 = y, y + ROW
@@ -381,8 +386,12 @@ class Island:
         menu.add_checkbutton(label="Start with Windows", variable=self.autostart_var,
                              command=lambda: autostart.set_enabled(self.autostart_var.get()))
         menu.add_separator()
-        menu.add_command(label="Connect Claude Code…", command=lambda: self.connect_claude(False))
-        menu.add_command(label="Disconnect Claude Code…", command=lambda: self.connect_claude(True))
+        for label, disconnect in (("Connect agent", False), ("Disconnect agent", True)):
+            sub = tk.Menu(menu, tearoff=0)
+            for agent in agents.SPECS:
+                sub.add_command(label=agents.agent_name(agent) + "…",
+                                command=lambda a=agent, d=disconnect: self.connect_agent(a, d))
+            menu.add_cascade(label=label, menu=sub)
         menu.add_separator()
         menu.add_command(label="Clear shelf", command=self.clear_all)
         menu.add_command(label="Quit", command=self.root.destroy)
@@ -426,8 +435,9 @@ class Island:
             self.resize_to_content()
         self.root.after(POLL_MS, self.poll_events)
 
-    def connect_claude(self, disconnect):
-        path = agents.claude_settings_path()
+    def connect_agent(self, agent, disconnect):
+        name = agents.agent_name(agent)
+        path = agents.settings_path(agent)
         self.menu_open = True
         try:
             try:
@@ -439,16 +449,18 @@ class Island:
                 new = agents.remove_hooks(data)
             else:
                 python_exe, hook_path = agents.hook_target()
-                new = agents.merge_hooks(data, agents.hook_command(python_exe, hook_path))
+                command = agents.hook_command(python_exe, hook_path, agent)
+                native = agents.hook_command(python_exe, hook_path, agent, native=True)
+                new = agents.merge_hooks(data, command, agent, command_windows=native)
             patch = agents.diff(text, new)
             if not patch:
                 messagebox.showinfo("Mini-Bro", "Already up to date. Nothing to change.")
                 return
-            title = "Disconnect Claude Code" if disconnect else "Connect Claude Code"
+            title = f"{'Disconnect' if disconnect else 'Connect'} {name}"
             if self.confirm_diff(title, path, patch):
                 backup = agents.apply_settings(path, new)
-                messagebox.showinfo("Mini-Bro", "Saved." + (f"\nBackup: {backup}" if backup else "")
-                                    + ("\nRestart Claude Code sessions to pick up the change." if not disconnect else ""))
+                note = "" if disconnect else AFTER_CONNECT.get(agent, "")
+                messagebox.showinfo("Mini-Bro", "Saved." + (f"\nBackup: {backup}" if backup else "") + note)
         finally:
             self.menu_open = False
             self.schedule_leave_check()

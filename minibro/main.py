@@ -38,15 +38,17 @@ def start_agent_server(events):
 
 
 def refresh_installed_hook():
-    """If Claude Code is connected, re-copy the relay script so app updates reach it."""
+    """If any agent is connected, re-copy the relay script so app updates reach it."""
     from . import agents
 
-    try:
-        data, _ = agents.read_settings(agents.claude_settings_path())
-        if agents.is_connected(data):
-            agents.hook_target()
-    except (OSError, ValueError):
-        pass
+    for agent in agents.SPECS:
+        try:
+            data, _ = agents.read_settings(agents.settings_path(agent))
+            if agents.is_connected(data):
+                agents.hook_target()
+                return
+        except (OSError, ValueError):
+            continue
 
 
 def main():

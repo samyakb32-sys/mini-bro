@@ -173,6 +173,23 @@ class RelayTests(unittest.TestCase):
         _, msg = self.events.get(timeout=5)
         self.assertLessEqual(len(msg["message"]), 2049)
 
+    def test_agent_flag_and_codex_permission(self):
+        self.serve()
+        self.answer_with("allow")
+        p = subprocess.run([sys.executable, "-I", "-S", HOOK, "--agent", "codex"], input=json.dumps(self.PERM),
+                           capture_output=True, text=True, env=self.env, timeout=10)
+        self.assertEqual(json.loads(p.stdout)["hookSpecificOutput"]["decision"]["behavior"], "allow")
+
+    def test_gemini_notification_is_status_only(self):
+        self.serve()
+        p = subprocess.run([sys.executable, "-I", "-S", HOOK, "--agent", "gemini"], capture_output=True, text=True,
+                           input=json.dumps({"hook_event_name": "Notification", "notification_type": "ToolPermission",
+                                             "session_id": "g1", "cwd": "/p", "message": "needs permission"}),
+                           env=self.env, timeout=10)
+        self.assertEqual(p.stdout, "")
+        kind, msg = self.events.get(timeout=5)
+        self.assertEqual((kind, msg["agent"], msg["event"]), ("event", "gemini", "Notification"))
+
     def test_wrong_token_is_ignored(self):
         self.serve()
         with open(os.path.join(self.tmp.name, "token"), "w") as f:
@@ -180,6 +197,61 @@ class RelayTests(unittest.TestCase):
         self.run_hook({"hook_event_name": "Stop", "session_id": "s"})
         time.sleep(0.3)
         self.assertTrue(self.events.empty())
+
+
+class MultiAgentTests(unittest.TestCase):
+    CMD = '"python" -I -S "C:/x/minibro-hook.py" --agent {}'
+
+    def merged(self, agent, base=None, **kw):
+        return agents.merge_hooks(base or {}, self.CMD.format(agent), agent, **kw)
+
+    def test_codex_shape(self):
+        out = self.merged("codex", command_windows='"python" "C:\\x\\minibro-hook.py" --agent codex')
+        self.assertEqual(set(out["hooks"]), {"SessionStart", "SessionEnd", "UserPromptSubmit", "PermissionRequest", "Stop"})
+        perm = out["hooks"]["PermissionRequest"][0]
+        self.assertEqual(perm["matcher"], "*")
+        self.assertEqual(perm["hooks"][0]["timeout"], 120)  # seconds
+        self.assertIn("commandWindows", perm["hooks"][0])
+        self.assertLessEqual(out["hooks"]["SessionEnd"][0]["hooks"][0]["timeout"], 3)  # Codex caps SessionEnd at 3 s
+        self.assertTrue(agents.is_connected(out))
+
+    def test_codex_keeps_description_and_other_hooks(self):
+        base = {"description": "mine", "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "x"}]}]}}
+        out = self.merged("codex", base)
+        self.assertEqual(out["description"], "mine")
+        self.assertEqual(out["hooks"]["PreToolUse"], base["hooks"]["PreToolUse"])
+        self.assertEqual(agents.remove_hooks(out), base)
+
+    def test_gemini_shape(self):
+        out = self.merged("gemini", {"theme": "dark"})
+        self.assertEqual(out["theme"], "dark")
+        self.assertEqual(set(out["hooks"]), {"SessionStart", "SessionEnd", "BeforeAgent", "AfterAgent", "Notification"})
+        self.assertNotIn("PermissionRequest", out["hooks"])  # Gemini cannot answer permission prompts
+        handler = out["hooks"]["BeforeAgent"][0]["hooks"][0]
+        self.assertEqual(handler["timeout"], 5000)  # milliseconds
+        self.assertEqual(handler["name"], agents.MARKER)
+        self.assertNotIn("matcher", out["hooks"]["BeforeAgent"][0])
+        self.assertEqual(agents.remove_hooks(out), {"theme": "dark"})
+
+    def test_settings_paths(self):
+        self.assertTrue(agents.settings_path("codex").endswith(os.path.join(".codex", "hooks.json")))
+        self.assertTrue(agents.settings_path("gemini").endswith(os.path.join(".gemini", "settings.json")))
+
+    def test_native_command_keeps_backslashes(self):
+        cmd = agents.hook_command(r"C:\Py\python.exe", r"C:\a\minibro-hook.py", "codex", native=True)
+        self.assertIn("\\", cmd)
+        self.assertIn("--agent codex", cmd)
+
+    def test_tracker_gemini_events(self):
+        t = agents.Tracker()
+        t.update({"agent": "gemini", "session_id": "g", "event": "BeforeAgent", "cwd": "/p"})
+        self.assertEqual(t.list()[0]["status"], "working")
+        t.update({"agent": "gemini", "session_id": "g", "event": "Notification"})
+        self.assertEqual(t.list()[0]["status"], "waiting")
+        t.update({"agent": "gemini", "session_id": "g", "event": "AfterAgent"})
+        self.assertEqual(t.list()[0]["status"], "idle")
+        self.assertEqual(agents.agent_name("gemini"), "Gemini CLI")
+        self.assertEqual(agents.agent_name("codex"), "Codex")
 
 
 if __name__ == "__main__":

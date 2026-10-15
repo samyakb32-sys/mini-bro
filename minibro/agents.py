@@ -8,15 +8,21 @@ import time
 from .config import write_json_atomic
 
 MARKER = "minibro-hook"  # present in every command we install, so we can find and remove our entries
-NAMES = {"claude": "Claude Code"}
-# event -> (needs matcher, timeout seconds)
-HOOK_EVENTS = {
-    "SessionStart": (False, 5),
-    "SessionEnd": (False, 5),
-    "UserPromptSubmit": (False, 5),
-    "PermissionRequest": (True, 120),
-    "Notification": (False, 5),
-    "Stop": (False, 5),
+NAMES = {"claude": "Claude Code", "codex": "Codex", "gemini": "Gemini CLI"}
+# Per agent: where its hooks live and which events we subscribe to, as event -> (needs matcher, timeout).
+# Timeouts are seconds for Claude Code and Codex, milliseconds for Gemini CLI.
+# Only Claude Code and Codex have a hook that can answer a permission prompt; Gemini's Notification is
+# observe-only, so Gemini sessions show status but never an Allow/Deny card.
+SPECS = {
+    "claude": {"path": (".claude", "settings.json"), "events": {
+        "SessionStart": (False, 5), "SessionEnd": (False, 5), "UserPromptSubmit": (False, 5),
+        "PermissionRequest": (True, 120), "Notification": (False, 5), "Stop": (False, 5)}},
+    "codex": {"path": (".codex", "hooks.json"), "events": {
+        "SessionStart": (False, 5), "SessionEnd": (False, 2), "UserPromptSubmit": (False, 5),
+        "PermissionRequest": (True, 120), "Stop": (False, 5)}},
+    "gemini": {"path": (".gemini", "settings.json"), "events": {
+        "SessionStart": (False, 5000), "SessionEnd": (False, 5000), "BeforeAgent": (False, 5000),
+        "AfterAgent": (False, 5000), "Notification": (False, 5000)}},
 }
 SESSION_TTL = 12 * 3600
 
@@ -54,8 +60,8 @@ class Tracker:
         if event == "SessionEnd":
             self.sessions.pop(key, None)
             return
-        status = {"UserPromptSubmit": "working", "PermissionRequest": "waiting",
-                  "Notification": "waiting", "Stop": "idle", "SessionStart": "idle"}.get(event)
+        status = {"UserPromptSubmit": "working", "BeforeAgent": "working", "PermissionRequest": "waiting",
+                  "Notification": "waiting", "Stop": "idle", "AfterAgent": "idle", "SessionStart": "idle"}.get(event)
         if status is None:
             return
         s = self.sessions.setdefault(key, {"agent": key[0], "session_id": key[1], "cwd": "", "status": "idle"})
@@ -81,13 +87,16 @@ class Tracker:
 
 # --- Claude Code settings.json ------------------------------------------------------------------
 
-def claude_settings_path():
-    return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+def settings_path(agent):
+    return os.path.join(os.path.expanduser("~"), *SPECS[agent]["path"])
 
 
-def hook_command(python_exe, hook_path, agent="claude"):
-    """Claude Code on Windows runs hooks through Git Bash, so use forward slashes."""
-    py, hp = python_exe.replace("\\", "/"), hook_path.replace("\\", "/")
+def hook_command(python_exe, hook_path, agent="claude", native=False):
+    """Claude Code on Windows runs hooks through Git Bash, so by default use forward slashes.
+    native=True keeps Windows backslashes (for Codex's commandWindows override)."""
+    py, hp = python_exe, hook_path
+    if not native:
+        py, hp = py.replace("\\", "/"), hp.replace("\\", "/")
     if hp.lower().endswith(".exe"):
         return f'"{hp}" --agent {agent}'
     return f'"{py}" -I -S "{hp}" --agent {agent}'
@@ -109,11 +118,16 @@ def remove_hooks(settings):
     return out
 
 
-def merge_hooks(settings, command):
+def merge_hooks(settings, command, agent="claude", command_windows=None):
     out = remove_hooks(settings)
     hooks = out.setdefault("hooks", {})
-    for event, (matcher, timeout) in HOOK_EVENTS.items():
-        entry = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+    for event, (matcher, timeout) in SPECS[agent]["events"].items():
+        handler = {"type": "command", "command": command, "timeout": timeout}
+        if agent == "gemini":
+            handler["name"] = MARKER
+        if agent == "codex" and command_windows:
+            handler["commandWindows"] = command_windows  # Codex's Windows-only override
+        entry = {"hooks": [handler]}
         if matcher:
             entry["matcher"] = "*"
         hooks.setdefault(event, []).append(entry)
